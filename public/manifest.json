@@ -1,0 +1,24 @@
+{
+  "short_name": "Monitor POS",
+  "name": "DC - Monitor de Ventas POS",
+  "description": "Monitor de ventas en tiempo real para Soft Restaurant por DC Asesorias",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "type": "image/png",
+      "sizes": "192x192",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "any maskable"
+    }
+  ],
+  "start_url": "/",
+  "background_color": "#0F172A",
+  "theme_color": "#0F172A",
+  "display": "standalone",
+  "orientation": "portrait"
+}
