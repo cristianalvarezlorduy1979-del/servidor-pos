@@ -1,5 +1,6 @@
 const express = require('express');
 const http = require('http');
+const https = require('https');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const path = require('path');
@@ -28,24 +29,155 @@ const io = new Server(server, {
 const API_KEY = "sr11_secret_token_2026";
 const PORT = process.env.PORT || 3001;
 const DATA_FILE = path.join(__dirname, 'restaurants_cache.json');
+const FIRESTORE_PROJECT = "dcasesorias-col";
 
-// Almacen multicliente persistente en disco
+// AlmacÃ©n multicliente en memoria
 let restaurantsData = {};
+
+// 1. Cargar cachÃ© de disco local si existe
 try {
   if (fs.existsSync(DATA_FILE)) {
     restaurantsData = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    console.log('[CACHE DISCO] Datos de restaurantes restaurados exitosamente.');
+    console.log('[CACHE DISCO] Restaurados restaurantes desde disco local.');
   }
 } catch (e) {
-  console.log('[CACHE DISCO] Error leyendo cache:', e);
+  console.log('[CACHE DISCO] Error leyendo cache disco:', e.message);
 }
 
 function saveCache() {
   try {
     fs.writeFileSync(DATA_FILE, JSON.stringify(restaurantsData, null, 2), 'utf8');
   } catch (e) {
-    console.log('[CACHE DISCO] Error guardando cache:', e);
+    console.log('[CACHE DISCO] Error guardando cache disco:', e.message);
   }
+}
+
+// 2. Persistencia en la nube (Firebase Firestore)
+// Esto sobrevive a los reinicios y suspensiÃ³n (sleep) de Render.com sin costo alguno
+function saveToFirestore(restaurantId, data) {
+  return new Promise((resolve) => {
+    try {
+      const payloadStr = JSON.stringify(data);
+      const body = JSON.stringify({
+        fields: {
+          payload: { stringValue: payloadStr },
+          restaurant_name: { stringValue: data.restaurant_name || '' },
+          total_ventas: { doubleValue: data.resumen?.total_ventas || 0 },
+          total_ayer: { doubleValue: data.ayer?.total_ventas || 0 },
+          updated_at: { stringValue: new Date().toISOString() }
+        }
+      });
+
+      const req = https.request({
+        hostname: 'firestore.googleapis.com',
+        path: `/v1/projects/${FIRESTORE_PROJECT}/databases/(default)/documents/pos_cache/${encodeURIComponent(restaurantId)}`,
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body)
+        }
+      }, (res) => {
+        let respData = '';
+        res.on('data', chunk => respData += chunk);
+        res.on('end', () => {
+          if (res.statusCode === 200) {
+            console.log(`[NUBE FIRESTORE] Guardado exitoso de ${restaurantId.toUpperCase()}`);
+          }
+          resolve(res.statusCode === 200);
+        });
+      });
+
+      req.on('error', (err) => {
+        console.log('[NUBE FIRESTORE] Error de red al guardar:', err.message);
+        resolve(false);
+      });
+      req.setTimeout(8000, () => {
+        req.destroy();
+        resolve(false);
+      });
+      req.write(body);
+      req.end();
+    } catch (err) {
+      console.log('[NUBE FIRESTORE] ExcepciÃ³n al guardar:', err.message);
+      resolve(false);
+    }
+  });
+}
+
+function loadFromFirestore(restaurantId) {
+  return new Promise((resolve) => {
+    try {
+      const req = https.get(
+        `https://firestore.googleapis.com/v1/projects/${FIRESTORE_PROJECT}/databases/(default)/documents/pos_cache/${encodeURIComponent(restaurantId)}`,
+        (res) => {
+          let respData = '';
+          res.on('data', chunk => respData += chunk);
+          res.on('end', () => {
+            try {
+              const json = JSON.parse(respData);
+              if (json.fields?.payload?.stringValue) {
+                const parsed = JSON.parse(json.fields.payload.stringValue);
+                resolve(parsed);
+              } else {
+                resolve(null);
+              }
+            } catch (e) {
+              resolve(null);
+            }
+          });
+        }
+      );
+      req.on('error', () => resolve(null));
+      req.setTimeout(8000, () => {
+        req.destroy();
+        resolve(null);
+      });
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+async function restoreAllFromFirestore() {
+  console.log('[NUBE FIRESTORE] Consultando base de datos persistente en la nube...');
+  return new Promise((resolve) => {
+    try {
+      const req = https.get(
+        `https://firestore.googleapis.com/v1/projects/${FIRESTORE_PROJECT}/databases/(default)/documents/pos_cache`,
+        (res) => {
+          let respData = '';
+          res.on('data', chunk => respData += chunk);
+          res.on('end', () => {
+            try {
+              const json = JSON.parse(respData);
+              if (json.documents && Array.isArray(json.documents)) {
+                let count = 0;
+                json.documents.forEach(doc => {
+                  try {
+                    const id = doc.name.split('/').pop().toLowerCase();
+                    if (doc.fields?.payload?.stringValue) {
+                      const data = JSON.parse(doc.fields.payload.stringValue);
+                      // Solo asignar si la memoria no tiene datos mÃ¡s recientes
+                      if (!restaurantsData[id] || (data.timestamp && (!restaurantsData[id].timestamp || data.timestamp > restaurantsData[id].timestamp))) {
+                        restaurantsData[id] = data;
+                        count++;
+                      }
+                    }
+                  } catch (e) {}
+                });
+                console.log(`[NUBE FIRESTORE] Â¡${count} restaurantes restaurados desde la nube! Datos intactos aunque el PC estÃ© apagado.`);
+              }
+            } catch (e) {}
+            resolve();
+          });
+        }
+      );
+      req.on('error', () => resolve());
+      req.setTimeout(8000, () => { req.destroy(); resolve(); });
+    } catch {
+      resolve();
+    }
+  });
 }
 
 function getDefaultData(restaurantId = "rest_001", name = "Soft Restaurant 11") {
@@ -78,21 +210,25 @@ function getDefaultData(restaurantId = "rest_001", name = "Soft Restaurant 11") 
   };
 }
 
-// Middleware de autenticacion
+// Middleware de autenticaciÃ³n
 const authMiddleware = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
-    return res.status(401).json({ error: "Token de autorizacion invalido" });
+    return res.status(401).json({ error: "Token de autorizaciÃ³n invÃ¡lido" });
   }
   next();
 };
 
-// Endpoint que recibe la sincronizacion desde cualquier restaurante
+// Control de debounce para no saturar Firestore
+const lastFirestoreSync = {};
+
+// Endpoint que recibe la sincronizaciÃ³n desde el agente en el restaurante
 app.post('/api/pos/sync', authMiddleware, (req, res) => {
   const restaurantId = (req.body.restaurant_id || 'rest_001').toLowerCase().trim();
   
-  // Si los datos previos tenian 'ayer' y el nuevo no lo trae, preservarlo
-  const prevAyer = restaurantsData[restaurantId]?.ayer;
+  // Preservar 'ayer' si los datos nuevos no lo traen o viene en 0
+  const prevData = restaurantsData[restaurantId];
+  const prevAyer = prevData?.ayer;
   const newAyer = req.body.ayer && req.body.ayer.total_ventas > 0 ? req.body.ayer : (prevAyer || req.body.ayer);
 
   restaurantsData[restaurantId] = {
@@ -107,7 +243,17 @@ app.post('/api/pos/sync', authMiddleware, (req, res) => {
 
   const payload = restaurantsData[restaurantId];
 
-  // Emitir unicamenta a los telefonos que estan viendo este restaurante especifico
+  // Sincronizar a Firestore en la nube (con debounce de 15 segundos o si cambiaron ventas)
+  const now = Date.now();
+  const lastSync = lastFirestoreSync[restaurantId] || 0;
+  const salesChanged = !prevData || prevData.resumen?.total_ventas !== payload.resumen?.total_ventas;
+
+  if (salesChanged || (now - lastSync > 15000)) {
+    lastFirestoreSync[restaurantId] = now;
+    saveToFirestore(restaurantId, payload);
+  }
+
+  // Emitir por WebSockets a los telÃ©fonos conectados
   io.to(restaurantId).emit('pos_update', payload);
   io.emit(`pos_update_${restaurantId}`, payload);
 
@@ -115,15 +261,25 @@ app.post('/api/pos/sync', authMiddleware, (req, res) => {
   res.json({ success: true, message: `Datos del restaurante ${restaurantId} actualizados` });
 });
 
-// Endpoint para consultar datos iniciales de un restaurante especifico
-app.get('/api/pos/stats', (req, res) => {
+// Endpoint para consultar datos iniciales de un restaurante especÃ­fico
+app.get('/api/pos/stats', async (req, res) => {
   const restaurantId = (req.query.restaurant_id || req.query.id || 'rest_001').toLowerCase().trim();
+  
+  // Si no estÃ¡ en RAM (ej: Render acaba de despertar de suspensiÃ³n), traerlo de Firestore
+  if (!restaurantsData[restaurantId] || (!restaurantsData[restaurantId].resumen?.total_ventas && !restaurantsData[restaurantId].ayer?.total_ventas)) {
+    const cloudData = await loadFromFirestore(restaurantId);
+    if (cloudData) {
+      restaurantsData[restaurantId] = cloudData;
+      console.log(`[STATS] Datos de ${restaurantId} recuperados de Firestore para consulta.`);
+    }
+  }
+
   const raw = restaurantsData[restaurantId] || getDefaultData(restaurantId, `Restaurante ${restaurantId}`);
   
-  // Determinar si la PC esta online o apagada
+  // Determinar si la PC estÃ¡ online o apagada
   const now = new Date();
   const last = raw.last_received ? new Date(raw.last_received) : null;
-  const isOnline = last && ((now - last) / 1000) < 60; // recibido hace menos de 60s
+  const isOnline = last && ((now - last) / 1000) < 90; // recibido hace menos de 90 segundos
   
   const data = {
     ...raw,
@@ -132,36 +288,41 @@ app.get('/api/pos/stats', (req, res) => {
   res.json(data);
 });
 
-// Endpoint para listar restaurantes activos (util para administracion)
+// Endpoint para listar restaurantes activos
 app.get('/api/pos/restaurants', (req, res) => {
   const list = Object.keys(restaurantsData).map(id => ({
     id: id,
     name: restaurantsData[id].restaurant_name,
     last_received: restaurantsData[id].last_received,
-    total_ventas: restaurantsData[id].resumen.total_ventas
+    total_ventas: restaurantsData[id].resumen?.total_ventas || 0,
+    ayer_ventas: restaurantsData[id].ayer?.total_ventas || 0
   }));
   res.json(list);
 });
 
-// Manejo de conexiones WebSockets por sala privada
+// Manejo de conexiones WebSockets
 io.on('connection', (socket) => {
-  console.log(`[CLIENTE CONECTADO] Socket ID: ${socket.id}`);
-
-  // El telefono se une a la sala de su restaurante
-  socket.on('join_restaurant', (restaurantId) => {
+  socket.on('join_restaurant', async (restaurantId) => {
     if (!restaurantId) restaurantId = 'rest_001';
     restaurantId = restaurantId.toLowerCase().trim();
     
     socket.join(restaurantId);
-    console.log(`[SALA ASIGNADA] Socket ${socket.id} se unio al restaurante: ${restaurantId}`);
 
-    // Enviarle de inmediato los datos de ese restaurante
-    const data = restaurantsData[restaurantId] || getDefaultData(restaurantId, `Restaurante ${restaurantId}`);
-    socket.emit('pos_update', data);
-  });
+    // Si no estÃ¡ en RAM, cargar de Firestore
+    if (!restaurantsData[restaurantId]) {
+      const cloudData = await loadFromFirestore(restaurantId);
+      if (cloudData) restaurantsData[restaurantId] = cloudData;
+    }
 
-  socket.on('disconnect', () => {
-    console.log(`[CLIENTE DESCONECTADO] Socket ID: ${socket.id}`);
+    const raw = restaurantsData[restaurantId] || getDefaultData(restaurantId, `Restaurante ${restaurantId}`);
+    const now = new Date();
+    const last = raw.last_received ? new Date(raw.last_received) : null;
+    const isOnline = last && ((now - last) / 1000) < 90;
+
+    socket.emit('pos_update', {
+      ...raw,
+      status: isOnline ? "online" : "offline"
+    });
   });
 });
 
@@ -171,8 +332,11 @@ app.get('*', (req, res, next) => {
   res.sendFile(indexPath);
 });
 
-server.listen(PORT, '0.0.0.0', () => {
+server.listen(PORT, '0.0.0.0', async () => {
   console.log(`=======================================================`);
   console.log(` Servidor Multi-Restaurante POS escuchando en puerto ${PORT}`);
   console.log(`=======================================================`);
+  
+  // Restaurar automÃ¡ticamente la base de datos de todos los restaurantes al iniciar
+  await restoreAllFromFirestore();
 });
