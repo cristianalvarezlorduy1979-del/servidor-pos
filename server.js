@@ -261,10 +261,48 @@ app.post('/api/pos/sync', authMiddleware, (req, res) => {
   res.json({ success: true, message: `Datos del restaurante ${restaurantId} actualizados` });
 });
 
+// Endpoint para validar si una empresa/restaurante existe
+app.get('/api/pos/validate', async (req, res) => {
+  const restaurantId = (req.query.restaurant_id || req.query.id || '').toLowerCase().trim();
+  if (!restaurantId) {
+    return res.status(400).json({ exists: false, error: "codigo_vacio", message: "Por favor ingresa un código de empresa." });
+  }
+
+  // 1. Revisar en memoria RAM
+  if (restaurantsData[restaurantId]) {
+    return res.json({
+      exists: true,
+      restaurant_id: restaurantId,
+      restaurant_name: restaurantsData[restaurantId].restaurant_name
+    });
+  }
+
+  // 2. Revisar en base de datos en la nube (Firestore)
+  const cloudData = await loadFromFirestore(restaurantId);
+  if (cloudData) {
+    restaurantsData[restaurantId] = cloudData;
+    return res.json({
+      exists: true,
+      restaurant_id: restaurantId,
+      restaurant_name: cloudData.restaurant_name
+    });
+  }
+
+  // 3. La empresa no existe
+  return res.status(404).json({
+    exists: false,
+    error: "empresa_no_existe",
+    message: "La empresa no existe. Verifica el código e intenta nuevamente."
+  });
+});
+
 // Endpoint para consultar datos iniciales de un restaurante específico
 app.get('/api/pos/stats', async (req, res) => {
-  const restaurantId = (req.query.restaurant_id || req.query.id || 'rest_001').toLowerCase().trim();
-  
+  const restaurantId = (req.query.restaurant_id || req.query.id || '').toLowerCase().trim();
+  if (!restaurantId) {
+    return res.status(400).json({ error: "codigo_vacio", message: "Código no especificado" });
+  }
+
   // Si no está en RAM (ej: Render acaba de despertar de suspensión), traerlo de Firestore
   if (!restaurantsData[restaurantId] || (!restaurantsData[restaurantId].resumen?.total_ventas && !restaurantsData[restaurantId].ayer?.total_ventas)) {
     const cloudData = await loadFromFirestore(restaurantId);
@@ -274,7 +312,16 @@ app.get('/api/pos/stats', async (req, res) => {
     }
   }
 
-  const raw = restaurantsData[restaurantId] || getDefaultData(restaurantId, `Restaurante ${restaurantId}`);
+  // Si no existe ni en RAM ni en Firestore
+  if (!restaurantsData[restaurantId]) {
+    return res.status(404).json({
+      exists: false,
+      error: "empresa_no_existe",
+      message: "La empresa no existe."
+    });
+  }
+
+  const raw = restaurantsData[restaurantId];
   
   // Determinar si la PC está online o apagada
   const now = new Date();
