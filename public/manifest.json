@@ -1,7 +1,7 @@
 {
-  "short_name": "Monitor POS",
-  "name": "DC - Monitor de Ventas POS",
-  "description": "Monitor de ventas en tiempo real para Soft Restaurant por DC Asesorias",
+  "short_name": "DC Monitor",
+  "name": "DC Monitor",
+  "description": "DC Monitor - Monitor de ventas en tiempo real por DC Asesorias",
   "icons": [
     {
       "src": "/icon-192.png",
