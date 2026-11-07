@@ -195,7 +195,8 @@ function getDefaultData(restaurantId = "rest_001", name = "Soft Restaurant 11") 
     },
     cuentas_abiertas: {
       cantidad: 0,
-      monto: 0
+      monto: 0,
+      detalle: []
     },
     formas_pago: [],
     ventas_por_hora: [],
